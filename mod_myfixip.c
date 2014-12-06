@@ -6,19 +6,13 @@
     v0.3 - 2014.12.06, Support for PROXY protocol v1 (haproxy)
     v0.4 - 2014.12.06, Porting to Apache 2.4
     
-    == TODO ==
-    Security: Detectar automaticamente si es una conexion SSL e ignorar 
-              la cabecera de los headers y usar solo el HELO 
-              Quiza: r->notes("ssl-secure-reneg"=>0/1) ???
-              Workarround: Usar el parametro RewriteIPResetHeader
-    
     = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-    In HTTP (no SSL): this will fix "remote_ip" field if the request 
+    In HTTP (no SSL): this will fix "useragent_ip" field if the request 
     contains an "X-Cluster-Client-Ip" header field, and the request came 
     directly from a one of the IP Addresses specified in the configuration 
     file (RewriteIPAllow directive).
 
-    In HTTPS (SSL): this will fix "remote_ip" field if any of:
+    In HTTPS (SSL): this will fix "useragent_ip" field if any of:
     1) the connection buffer begins with "HELOxxxx" (there xxxx is IPv4 in 
        binary format -netorder-)
     2) buffer follow PROXY protocol v1
@@ -84,12 +78,9 @@
 
 // References:
 // http://ci.apache.org/projects/httpd/trunk/doxygen/
-// http://apr.apache.org/docs/apr/1.4/
-// http://httpd.apache.org/docs/2.3/developer/
+// http://apr.apache.org/docs/apr/1.5/
+// http://httpd.apache.org/docs/2.4/developer/
 // http://onlamp.com/pub/ct/38
-// http://svn.apache.org/repos/asf/httpd/httpd/branches/2.2.x/modules/aaa/mod_authz_host.c
-// http://svn.apache.org/repos/asf/httpd/httpd/branches/2.2.x/modules/experimental/mod_example.c
-// http://svn.apache.org/repos/asf/httpd/httpd/branches/2.2.x/modules/filters/mod_reqtimeout.c
 // http://svn.apache.org/repos/asf/httpd/httpd/tags/2.4.0/modules/metadata/mod_remoteip.c
 // http://docs.aws.amazon.com/ElasticLoadBalancing/latest/DeveloperGuide/elb-listener-config.html
 // http://docs.aws.amazon.com/ElasticLoadBalancing/latest/DeveloperGuide/enable-proxy-protocol.html
