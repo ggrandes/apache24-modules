@@ -364,11 +364,19 @@ static void save_req_ip(request_rec *r)
  */
 static void rewrite_req_ip(request_rec *r, const char *new_ip)
 {
-    //conn_rec *c = r->connection;
+    conn_rec *c = r->connection;
     // Rewrite IP
-    r->useragent_ip = (char *)new_ip;
-    inet_aton(new_ip, &(r->useragent_addr->sa.sin.sin_addr));
+    apr_sockaddr_t *temp_sa = r->useragent_addr;
+    apr_sockaddr_info_get(&temp_sa, new_ip,
+                                    APR_UNSPEC, temp_sa->port,
+                                    APR_IPV4_ADDR_OK, c->pool);
+    r->useragent_addr = temp_sa;
+    apr_sockaddr_ip_get(&r->useragent_ip, r->useragent_addr);
+    apr_sockaddr_ip_get(&c->remote_host, r->useragent_addr);
     //c->remote_host = NULL; // Force DNS re-resolution
+#ifdef DEBUG
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::rewrite_req_ip IP Connection from: %s [%s] to port=%d newip=%s (OK)", c->client_ip, r->useragent_ip, c->local_addr->port, new_ip);
+#endif
 }
 
 /**
