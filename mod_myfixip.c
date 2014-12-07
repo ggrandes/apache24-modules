@@ -404,6 +404,10 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
     ap_get_brigade(f->next, b, mode, block, readbytes);
     e = APR_BRIGADE_FIRST(b);
 
+    if (APR_BRIGADE_EMPTY(b)) {
+        return APR_SUCCESS;
+    }
+
     if (e->type == NULL) {
         return APR_SUCCESS;
     }
