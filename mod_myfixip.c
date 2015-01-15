@@ -1,10 +1,12 @@
 /*
-    Apache 2.4 mod_myfixip -- Author: G.Grandes
+    Apache 2.2/2.4 mod_myfixip -- Author: G.Grandes
     
     v0.1 - 2011.05.07, Init version (SSL)
     v0.2 - 2011.05.28, Mix version (SSL & Non-SSL)
     v0.3 - 2014.12.06, Support for PROXY protocol v1 (haproxy)
     v0.4 - 2014.12.06, Porting to Apache 2.4
+    v0.5 - 2015.01.14, Backport to Apache 2.2 with dual support 2.2/2.4
+                       Fix fragmented TCP frames in AWS-ELB
     
     = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
     In HTTP (no SSL): this will fix "useragent_ip" field if the request 
@@ -45,12 +47,12 @@
     # Global
     <IfModule mod_myfixip.c>
       RewriteIPResetHeader off
-      RewriteIPHookPortSSL 442
+      RewriteIPHookPortSSL 443
       RewriteIPAllow 192.168.0.0/16 127.0.0.1
     </IfModule>
     
     # VirtualHost
-    <VirtualHost *:442>
+    <VirtualHost *:443>
       <IfModule mod_myfixip.c>
         RewriteIPResetHeader on
       </IfModule>
@@ -103,11 +105,11 @@
 #include <arpa/inet.h>
 
 #define MODULE_NAME "mod_myfixip"
-#define MODULE_VERSION "0.4"
+#define MODULE_VERSION "0.5"
 
 module AP_MODULE_DECLARE_DATA myfixip_module;
 
-#define DEFAULT_PORT          442
+#define DEFAULT_PORT          443
 #define PROXY                 "PROXY"
 #define HELO                  "HELO"
 #define TEST                  "TEST"
@@ -117,10 +119,27 @@ module AP_MODULE_DECLARE_DATA myfixip_module;
 #define NOTE_REWRITE_IP       "FIXIP_REWRITE_USERAGENT_IP"
 #define NOTE_CLIENT_TRUST     "FIXIP_CLIENT_TRUSTED"
 
+#ifndef HDR_USERAGENT_IP
 #define HDR_USERAGENT_IP      "X-Cluster-Client-Ip" // FIXME: Do configurable name
+#endif
 
 //#define DEBUG
-#define DIRECT_REWRITE
+#define PROXY_MAX_LENGTH 107
+
+// Apache 2.4 or 2.2
+#if AP_SERVER_MINORVERSION_NUMBER > 3
+#define _REMOTE_HOST    c->remote_host
+#define _CLIENT_IP      c->client_ip
+#define _CLIENT_ADDR    c->client_addr
+#define _USERAGENT_IP   r->useragent_ip
+#define _USERAGENT_ADDR r->useragent_addr
+#else
+#define _REMOTE_HOST    c->remote_host
+#define _CLIENT_IP      c->remote_ip
+#define _CLIENT_ADDR    c->remote_addr
+#define _USERAGENT_IP   c->remote_ip
+#define _USERAGENT_ADDR c->remote_addr
+#endif
 
 typedef struct
 {
@@ -295,7 +314,7 @@ static int check_trusted( conn_rec *c, my_config *conf )
     if (trusted) return (trusted[0] == 'Y');
 
     // Find Access List & Permit/Deny rewrite IP of Client
-    if (find_accesslist(conf->allows, c->client_addr)) {
+    if (find_accesslist(conf->allows, _CLIENT_ADDR)) {
         apr_table_setn(c->notes, NOTE_CLIENT_TRUST, "Y");
         return 1;
     }
@@ -312,7 +331,7 @@ static int process_connection(conn_rec *c)
     my_config *conf = ap_get_module_config (c->base_server->module_config, &myfixip_module);
     
 #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::process_connection IP Connection from: %s to port=%d (1)", c->client_ip, c->local_addr->port);
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::process_connection IP Connection from: %s to port=%d (1)", _CLIENT_IP, c->local_addr->port);
 #endif
 
     if (c->local_addr->port != conf->port) {
@@ -355,7 +374,7 @@ static void save_req_ip(request_rec *r)
 
     const char *old_ip = apr_table_get(c->notes, NOTE_ORIGINAL_IP);
     if (!old_ip) {
-        apr_table_set(c->notes, NOTE_ORIGINAL_IP, r->useragent_ip);
+        apr_table_set(c->notes, NOTE_ORIGINAL_IP, _USERAGENT_IP);
     }
 }
 
@@ -366,16 +385,16 @@ static void rewrite_req_ip(request_rec *r, const char *new_ip)
 {
     conn_rec *c = r->connection;
     // Rewrite IP
-    apr_sockaddr_t *temp_sa = r->useragent_addr;
+    apr_sockaddr_t *temp_sa = _USERAGENT_ADDR;
     apr_sockaddr_info_get(&temp_sa, new_ip,
                                     APR_UNSPEC, temp_sa->port,
                                     APR_IPV4_ADDR_OK, c->pool);
-    r->useragent_addr = temp_sa;
-    apr_sockaddr_ip_get(&r->useragent_ip, r->useragent_addr);
-    apr_sockaddr_ip_get(&c->remote_host, r->useragent_addr);
+    _USERAGENT_ADDR = temp_sa;
+    apr_sockaddr_ip_get(&_USERAGENT_IP, _USERAGENT_ADDR);
+    apr_sockaddr_ip_get(&_REMOTE_HOST, _USERAGENT_ADDR);
     //c->remote_host = NULL; // Force DNS re-resolution
 #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::rewrite_req_ip IP Connection from: %s [%s] to port=%d newip=%s (OK)", c->client_ip, r->useragent_ip, c->local_addr->port, new_ip);
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::rewrite_req_ip IP Connection from: %s [%s] to port=%d newip=%s (OK)", _CLIENT_IP, _USERAGENT_IP, c->local_addr->port, new_ip);
 #endif
 }
 
@@ -386,13 +405,12 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
 {
     conn_rec *c = f->c;
     my_ctx *ctx = f->ctx;
-    my_config *conf = ap_get_module_config (c->base_server->module_config, &myfixip_module);
     const char *str = NULL;
-    apr_size_t length = 8;
+    apr_size_t length = 0;
     apr_bucket *e = NULL, *d = NULL;
 
 #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in IP Connection from: %s to port=%d (1)", c->client_ip, c->local_addr->port);
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in IP Connection from: %s to port=%d (1)", _CLIENT_IP, c->local_addr->port);
 #endif
 
     // Fail quickly if the connection has already been aborted.
@@ -419,11 +437,13 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
     }
 
 #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in IP Connection from: %s to port=%d (2)", c->client_ip, c->local_addr->port);
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in IP Connection from: %s to port=%d (2)", _CLIENT_IP, c->local_addr->port);
 #endif
 
-    // Read fisrt bucket
-    apr_bucket_read(e, &str, &length, APR_BLOCK_READ);
+    // Read first bucket (we need few bytes)
+    apr_status_t s = apr_bucket_read(e, &str, &length, APR_BLOCK_READ);
+    if (s != APR_SUCCESS)
+        return s;
 
     // TEST Command
     if (strncmp(TEST, str, 4) == 0) {
@@ -469,18 +489,54 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
 #ifdef DEBUG
         ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=PROXY OK");
 #endif
-        char *end = memchr(str, '\r', length - 1);
-        if (!end || end[1] != '\n') {
+        // Read full header from buckets
+        apr_uint32_t offset = 0;
+        char buf[PROXY_MAX_LENGTH + 1]; // worst case
+        while ((offset < PROXY_MAX_LENGTH) && (e != APR_BRIGADE_SENTINEL(b))) {
+            apr_status_t s = apr_bucket_read(e, &str, &length, APR_BLOCK_READ);
+            if (s != APR_SUCCESS) {
+                return s;
+            }
+            if ((offset + length) > PROXY_MAX_LENGTH) { // Overflow
+                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in ERROR: PROXY protocol header overflow from=%s to port=%d length=%d", _CLIENT_IP, c->local_addr->port, (length + offset));
+                goto ABORT_CONN2;
+            }
+#ifdef DEBUG
+            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: Data read from: %s to port=%d (3) length=%d off=%d", _CLIENT_IP, c->local_addr->port, length, offset);
+#endif
+            char *end = memchr(str, '\r', length - 1);
+            if (end) {
+                length = end - str;
+                length += 2;
+                apr_bucket_split(e, length);
+            }
+            memcpy(buf + offset, str, length);
+            offset += length;
+            buf[offset] = 0;
+#ifdef DEBUG
+            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: Data read from: %s to port=%d (4) length=%d newoff=%d (%s)", _CLIENT_IP, c->local_addr->port, length, offset, buf);
+#endif
+            d = e;
+            e = APR_BUCKET_NEXT(e);
+            APR_BUCKET_REMOVE(d);
+            d = NULL;
+            if (end) {
+                break;
+            }
+        }
+
+        char *end = buf + offset - 2;
+        if ((end[0] != '\r') || (end[1] != '\n')) {
             goto ABORT_CONN;
         }
         end[0] = ' '; // for next split
         end[1] = 0;
 #ifdef DEBUG
-        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=PROXY header=%s", str);
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=PROXY header=%s", buf);
 #endif
-        length = (end + 2 - str);
+        length = (end + 2 - buf);
         int size = length - 1;
-        char *ptr = (char *) str;
+        char *ptr = (char *) buf;
         int tok = 0;
         char *srcip = NULL, *dstip = NULL, *srcport = NULL, *dstport = NULL;
         while (ptr) {
@@ -526,18 +582,12 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
         if (!dstport) {
             goto ABORT_CONN;
         }
-        // delete PROXY protocol header
-        apr_bucket_split(e, length);
-        d = e;
-        e = APR_BUCKET_NEXT(e);
-        APR_BUCKET_REMOVE(d);
-        d = NULL;
-
         apr_table_set(c->notes, NOTE_REWRITE_IP, srcip);
         return APR_SUCCESS;
 
     ABORT_CONN:
-        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in ERROR: PROXY protocol header invalid from=%s", c->client_ip);
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in ERROR: PROXY protocol header invalid from=%s to port=%d", _CLIENT_IP, c->local_addr->port);
+    ABORT_CONN2:
         c->aborted = 1;
         return APR_ECONNABORTED;
     }
@@ -552,7 +602,6 @@ static int post_read_handler(request_rec *r)
     conn_rec *c = r->connection;
     my_config *conf = ap_get_module_config (c->base_server->module_config, &myfixip_module);
 
-    const char *remote_ip = c->client_ip;
     const char *new_ip = NULL;
 
     // Save original IP
@@ -571,9 +620,9 @@ static int post_read_handler(request_rec *r)
     }
 
 #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::post_read_handler IP Connection from: %s [%s] to port=%d newip=%s (OK)", c->client_ip, r->useragent_ip, c->local_addr->port, new_ip);
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::post_read_handler IP Connection from: %s [%s] to port=%d newip=%s (OK)", _CLIENT_IP, _USERAGENT_IP, c->local_addr->port, new_ip);
 #endif
-    if (new_ip && strcmp(r->useragent_ip, new_ip)) { // Change
+    if (new_ip && strcmp(_USERAGENT_IP, new_ip)) { // Change
         rewrite_req_ip(r, new_ip);
     }
 
