@@ -1,21 +1,23 @@
 /*
     Apache 2.2/2.4 mod_myfixip -- Author: G.Grandes
-    
+
     v0.1 - 2011.05.07, Init version (SSL)
     v0.2 - 2011.05.28, Mix version (SSL & Non-SSL)
     v0.3 - 2014.12.06, Support for PROXY protocol v1 (haproxy)
     v0.4 - 2014.12.06, Porting to Apache 2.4
     v0.5 - 2015.01.14, Backport to Apache 2.2 with dual support 2.2/2.4
                        Fix fragmented TCP frames in AWS-ELB
-    
+    v0.6 - 2015.01.17, Fix fragmented SSL frames
+                       Removed RewriteIPHookPortSSL directive
+
     = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-    In HTTP (no SSL): this will fix "useragent_ip" field if the request 
-    contains an "X-Cluster-Client-Ip" header field, and the request came 
-    directly from a one of the IP Addresses specified in the configuration 
+    In HTTP (no SSL): this will fix "useragent_ip" field if the request
+    contains an "X-Cluster-Client-Ip" header field, and the request came
+    directly from a one of the IP Addresses specified in the configuration
     file (RewriteIPAllow directive).
 
     In HTTPS (SSL): this will fix "useragent_ip" field if any of:
-    1) the connection buffer begins with "HELOxxxx" (there xxxx is IPv4 in 
+    1) the connection buffer begins with "HELOxxxx" (there xxxx is IPv4 in
        binary format -netorder-)
     2) buffer follow PROXY protocol v1
 
@@ -35,42 +37,41 @@
          "PROXY UNKNOWN ffff:f...f:ffff ffff:f...f:ffff 65535 65535\r\n"
          => 5 + 1 + 7 + 1 + 39 + 1 + 39 + 1 + 5 + 1 + 5 + 2 = 107 chars
 
-       Complete Proxy-Protocol: 
+       Complete Proxy-Protocol:
          http://haproxy.1wt.eu/download/1.5/doc/proxy-protocol.txt
 
-    The rewrite address of request is allowed from a one of the IP Addresses 
+    The rewrite address of request is allowed from a one of the IP Addresses
     specified in the configuration file (RewriteIPAllow directive).
-    
-    
+
+
     Usage:
-    
+
     # Global
     <IfModule mod_myfixip.c>
       RewriteIPResetHeader off
-      RewriteIPHookPortSSL 443
       RewriteIPAllow 192.168.0.0/16 127.0.0.1
     </IfModule>
-    
+
     # VirtualHost
     <VirtualHost *:443>
       <IfModule mod_myfixip.c>
         RewriteIPResetHeader on
       </IfModule>
     </VirtualHost>
-    
+
     To play with this module first compile it into a
     DSO file and install it into Apache's modules directory
     by running:
-    
+
     $ apxs2 -c -i mod_myfixip.c
 
     = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
-    
+
     http://www.apache.org/licenses/LICENSE-2.0
-    
+
     Unless required by applicable law or agreed to in writing, software
     distributed under the License is distributed on an "AS IS" BASIS,
     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -105,11 +106,10 @@
 #include <arpa/inet.h>
 
 #define MODULE_NAME "mod_myfixip"
-#define MODULE_VERSION "0.5"
+#define MODULE_VERSION "0.6"
 
 module AP_MODULE_DECLARE_DATA myfixip_module;
 
-#define DEFAULT_PORT          443
 #define PROXY                 "PROXY"
 #define HELO                  "HELO"
 #define TEST                  "TEST"
@@ -166,7 +166,6 @@ static void *create_config(apr_pool_t *p, server_rec *s)
 {
     my_config *conf = apr_palloc(p, sizeof(my_config));
 
-    conf->port = DEFAULT_PORT;
     conf->allows = apr_array_make(p, 1, sizeof(accesslist));
     conf->resetHeader = 0;
 
@@ -183,7 +182,6 @@ static void *merge_config(apr_pool_t *p, void *parent_server1_conf, void *add_se
     my_config *s1conf = (my_config *) parent_server1_conf;
     my_config *s2conf = (my_config *) add_server2_conf;
 
-    //merged_config->port = (s1conf->port == s2conf->port) ? s1conf->port : s2conf->port;
     //merged_config->allows = (s1conf->allows == s2conf->allows) ? s1conf->allows : s2conf->allows;
     merged_config->resetHeader = (s1conf->resetHeader == s2conf->resetHeader) ? s1conf->resetHeader : s2conf->resetHeader;
 
@@ -203,28 +201,6 @@ static const char *reset_header_config_cmd(cmd_parms *parms, void *mconfig, int 
     }
 
     conf->resetHeader = flag ? TRUE : FALSE;
-    return NULL;
-}
-
-/**
- * Parse the RewriteIPHookPortSSL directive
- */
-static const char *port_config_cmd(cmd_parms *parms, void *mconfig, const char *arg)
-{
-    my_config *conf = ap_get_module_config(parms->server->module_config, &myfixip_module);
-    const char *err = ap_check_cmd_context (parms, GLOBAL_ONLY);
-    
-    if (err != NULL) {
-        return err;
-    }
-    
-    unsigned long int port = strtol(arg, (char **) NULL, 10);
-
-    if ((port > 65535) || (port < 1)) {
-        return "Integer overflow or invalid number";
-    }
-
-    conf->port = port;
     return NULL;
 }
 
@@ -272,7 +248,6 @@ static const char *allow_config_cmd(cmd_parms *cmd, void *dv, const char *where_
  */
 static command_rec cmds[] = {
     AP_INIT_FLAG("RewriteIPResetHeader", reset_header_config_cmd, NULL, RSRC_CONF, "Reset HTTP-Header in this SSL vhost?"),
-    AP_INIT_TAKE1("RewriteIPHookPortSSL", port_config_cmd, NULL, RSRC_CONF, "TCP Port where hack"),
     AP_INIT_ITERATE("RewriteIPAllow", allow_config_cmd, NULL, RSRC_CONF, "IP-address wildcards"),
     {NULL}
 };
@@ -329,14 +304,10 @@ static int check_trusted( conn_rec *c, my_config *conf )
 static int process_connection(conn_rec *c)
 {
     my_config *conf = ap_get_module_config (c->base_server->module_config, &myfixip_module);
-    
+
 #ifdef DEBUG
     ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::process_connection IP Connection from: %s to port=%d (1)", _CLIENT_IP, c->local_addr->port);
 #endif
-
-    if (c->local_addr->port != conf->port) {
-        return DECLINED;
-    }
 
     if (!check_trusted(c, conf)) { // Not Trusted
         return DECLINED;
@@ -407,10 +378,10 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
     my_ctx *ctx = f->ctx;
     const char *str = NULL;
     apr_size_t length = 0;
-    apr_bucket *e = NULL, *d = NULL;
+    apr_bucket *e = NULL;
 
 #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in IP Connection from: %s to port=%d (1)", _CLIENT_IP, c->local_addr->port);
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in IP Connection from: %s to port=%d readbytes=%lld (1)", _CLIENT_IP, c->local_addr->port, readbytes);
 #endif
 
     // Fail quickly if the connection has already been aborted.
@@ -469,10 +440,8 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
 #endif
         // delete HELO header
         apr_bucket_split(e, 8);
-        d = e;
+        APR_BUCKET_REMOVE(e);
         e = APR_BUCKET_NEXT(e);
-        APR_BUCKET_REMOVE(d);
-        d = NULL;
 
         // REWRITE CLIENT IP
         const char *new_ip = fromBinIPtoString(c->pool, str+4);
@@ -506,9 +475,14 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
 #endif
             char *end = memchr(str, '\r', length - 1);
             if (end) {
-                length = end - str;
-                length += 2;
-                apr_bucket_split(e, length);
+                apr_size_t nlength = end - str + 2;
+#ifdef DEBUG
+                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: split length=%d rest=%d", length, nlength);
+#endif
+                if (length != nlength) {
+                    length = nlength;
+                    apr_bucket_split(e, length);
+                }
             }
             memcpy(buf + offset, str, length);
             offset += length;
@@ -516,12 +490,19 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
 #ifdef DEBUG
             ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: Data read from: %s to port=%d (4) length=%d newoff=%d (%s)", _CLIENT_IP, c->local_addr->port, length, offset, buf);
 #endif
-            d = e;
+            APR_BUCKET_REMOVE(e);
             e = APR_BUCKET_NEXT(e);
-            APR_BUCKET_REMOVE(d);
-            d = NULL;
             if (end) {
                 break;
+            } else {
+                // Refill buckets
+                if ((e == APR_BRIGADE_SENTINEL(b)) && APR_BRIGADE_EMPTY(b)) {
+#ifdef DEBUG
+                    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: refill buffer size=%lld (1)", readbytes);
+#endif
+                    ap_get_brigade(f->next, b, mode, block, readbytes);
+                    e = APR_BRIGADE_FIRST(b);
+                }
             }
         }
 
@@ -583,6 +564,17 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
             goto ABORT_CONN;
         }
         apr_table_set(c->notes, NOTE_REWRITE_IP, srcip);
+#ifdef DEBUG
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=PROXY tokens OK");
+#endif
+        // Refill buckets
+        if (APR_BRIGADE_EMPTY(b)) {
+#ifdef DEBUG
+            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: refill buffer size=%lld (2)", readbytes);
+#endif
+            ap_get_brigade(f->next, b, mode, block, readbytes);
+            e = APR_BRIGADE_FIRST(b);
+        }
         return APR_SUCCESS;
 
     ABORT_CONN:
@@ -642,7 +634,7 @@ static void register_hooks(apr_pool_t *p)
      */
     ap_register_input_filter(myfixip_filter_name, helocon_filter_in, NULL, AP_FTYPE_CONNECTION + 9);
     ap_hook_post_config(post_config, NULL, NULL, APR_HOOK_MIDDLE);
-    ap_hook_child_init(child_init, NULL, NULL, APR_HOOK_MIDDLE);    
+    ap_hook_child_init(child_init, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_process_connection(process_connection, NULL, NULL, APR_HOOK_FIRST);
     ap_hook_post_read_request(post_read_handler, NULL, NULL, APR_HOOK_FIRST);
 }
