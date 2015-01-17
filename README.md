@@ -3,7 +3,7 @@
 Miscellaneous Modules for Apache 2.4 (and maybe 2.2), licensed under Apache License v2.0.
 
 | module  | description | state |
-| ------- | ----------- | ----- |
+| :------ | :---------- | :---- |
 | myfixip | Fix "remote_ip" in HTTP/HTTPS | stable |
 
 ---
