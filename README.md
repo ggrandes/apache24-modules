@@ -4,7 +4,7 @@ Miscellaneous Modules for Apache 2.4 (and maybe 2.2), licensed under Apache Lice
 
 | module  | description | state |
 | :------ | :---------- | :---- |
-| myfixip | Fix "remote_ip" in HTTP/HTTPS | stable |
+| myfixip | Fix "remote_ip" in HTTP/HTTPS ([PROXY protocol](http://www.haproxy.org/download/1.5/doc/proxy-protocol.txt), like ha-proxy and Amazon ELB) | stable |
 
 ---
 
