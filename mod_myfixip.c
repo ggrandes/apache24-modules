@@ -9,6 +9,7 @@
                        Fix fragmented TCP frames in AWS-ELB
     v0.6 - 2015.01.17, Fix fragmented SSL frames
                        Removed RewriteIPHookPortSSL directive
+    v0.7 - 2015.01.24, use defined format (APR_OFF_T_FMT) for apr_off_t
 
     = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
     In HTTP (no SSL): this will fix "useragent_ip" field if the request
@@ -106,7 +107,7 @@
 #include <arpa/inet.h>
 
 #define MODULE_NAME "mod_myfixip"
-#define MODULE_VERSION "0.6"
+#define MODULE_VERSION "0.7"
 
 module AP_MODULE_DECLARE_DATA myfixip_module;
 
@@ -381,7 +382,7 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
     apr_bucket *e = NULL;
 
 #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in IP Connection from: %s to port=%d readbytes=%lld (1)", _CLIENT_IP, c->local_addr->port, readbytes);
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in IP Connection from: %s to port=%d readbytes=%" APR_OFF_T_FMT " (1)", _CLIENT_IP, c->local_addr->port, readbytes);
 #endif
 
     // Fail quickly if the connection has already been aborted.
@@ -498,7 +499,7 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
                 // Refill buckets
                 if ((e == APR_BRIGADE_SENTINEL(b)) && APR_BRIGADE_EMPTY(b)) {
 #ifdef DEBUG
-                    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: refill buffer size=%lld (1)", readbytes);
+                    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: refill buffer size=%" APR_OFF_T_FMT " (1)", readbytes);
 #endif
                     ap_get_brigade(f->next, b, mode, block, readbytes);
                     e = APR_BRIGADE_FIRST(b);
@@ -570,7 +571,7 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
         // Refill buckets
         if (APR_BRIGADE_EMPTY(b)) {
 #ifdef DEBUG
-            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: refill buffer size=%lld (2)", readbytes);
+            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: refill buffer size=%" APR_OFF_T_FMT " (2)", readbytes);
 #endif
             ap_get_brigade(f->next, b, mode, block, readbytes);
             e = APR_BRIGADE_FIRST(b);
