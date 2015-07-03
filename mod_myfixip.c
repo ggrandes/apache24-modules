@@ -10,6 +10,8 @@
     v0.6 - 2015.01.17, Fix fragmented SSL frames
                        Removed RewriteIPHookPortSSL directive
     v0.7 - 2015.01.24, use defined format (APR_OFF_T_FMT) for apr_off_t
+    v0.8 - 2015.06.29, fixing zero length
+    v0.9 - 2015.07.03, handle fragmented headers
 
     = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
     In HTTP (no SSL): this will fix "useragent_ip" field if the request
@@ -81,14 +83,14 @@
 */
 
 // References:
-// http://ci.apache.org/projects/httpd/trunk/doxygen/
+// http://web.archive.org/web/20150328010857/http://ci.apache.org/projects/httpd/trunk/doxygen/
 // http://apr.apache.org/docs/apr/1.5/
 // http://httpd.apache.org/docs/2.4/developer/
 // http://onlamp.com/pub/ct/38
 // http://svn.apache.org/repos/asf/httpd/httpd/tags/2.4.0/modules/metadata/mod_remoteip.c
 // http://docs.aws.amazon.com/ElasticLoadBalancing/latest/DeveloperGuide/elb-listener-config.html
 // http://docs.aws.amazon.com/ElasticLoadBalancing/latest/DeveloperGuide/enable-proxy-protocol.html
-// http://haproxy.1wt.eu/download/1.5/doc/proxy-protocol.txt
+// http://www.haproxy.org/download/1.5/doc/proxy-protocol.txt
 // http://blog.haproxy.com/haproxy/proxy-protocol/
 
 #define CORE_PRIVATE
@@ -107,7 +109,7 @@
 #include <arpa/inet.h>
 
 #define MODULE_NAME "mod_myfixip"
-#define MODULE_VERSION "0.7"
+#define MODULE_VERSION "0.9"
 
 module AP_MODULE_DECLARE_DATA myfixip_module;
 
@@ -125,7 +127,9 @@ module AP_MODULE_DECLARE_DATA myfixip_module;
 #endif
 
 //#define DEBUG
+#define PROXY_HEAD_LENGTH 4
 #define PROXY_MAX_LENGTH 107
+#define PAD_MAGIC 0x04202015
 
 // Apache 2.4 or 2.2
 #if AP_SERVER_MINORVERSION_NUMBER > 3
@@ -144,6 +148,7 @@ module AP_MODULE_DECLARE_DATA myfixip_module;
 
 typedef struct
 {
+    apr_time_t time;
     apr_port_t port;
     apr_array_header_t *allows;
     int resetHeader;
@@ -153,9 +158,23 @@ typedef struct {
     apr_ipsubnet_t *ip;
 } accesslist;
 
+typedef enum {
+    PHASE_WANT_HEAD,  // first 4 bytes
+    PHASE_WANT_BINIP, // next 4 bytes
+    PHASE_WANT_LINE,  // full PROXY header
+    PHASE_DONE
+} my_phase;
+
 typedef struct
 {
-    int iter;
+    int magic;
+    my_phase phase;
+    ap_input_mode_t mode;
+    apr_off_t need;
+    apr_off_t recv;
+    apr_off_t offset;
+    char buf[PROXY_MAX_LENGTH + 1];
+    int pad;
 } my_ctx;
 
 static const char *const myfixip_filter_name = "myfixip_filter_name";
@@ -169,6 +188,7 @@ static void *create_config(apr_pool_t *p, server_rec *s)
 
     conf->allows = apr_array_make(p, 1, sizeof(accesslist));
     conf->resetHeader = 0;
+    conf->time = apr_time_now();
 
     return conf;
 }
@@ -222,7 +242,7 @@ static const char *allow_config_cmd(cmd_parms *cmd, void *dv, const char *where_
     if ((s = ap_strchr(where, '/'))) {
         *s++ = '\0';
         rv = apr_ipsubnet_create(&a->ip, where, s, cmd->pool);
-        if(APR_STATUS_IS_EINVAL(rv)) {
+        if (APR_STATUS_IS_EINVAL(rv)) {
             /* looked nothing like an IP address */
             return "An IP address was expected";
         }
@@ -307,7 +327,7 @@ static int process_connection(conn_rec *c)
     my_config *conf = ap_get_module_config (c->base_server->module_config, &myfixip_module);
 
 #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::process_connection IP Connection from: %s to port=%d (1)", _CLIENT_IP, c->local_addr->port);
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::process_connection IP Connection from: %s:%d to port=%d (1)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port);
 #endif
 
     if (!check_trusted(c, conf)) { // Not Trusted
@@ -315,7 +335,14 @@ static int process_connection(conn_rec *c)
     }
 
     my_ctx *cctx = apr_palloc(c->pool, sizeof(my_ctx));
-    cctx->iter = 0;
+    cctx->phase = PHASE_WANT_HEAD;
+    cctx->mode = AP_MODE_READBYTES;
+    cctx->need = PROXY_HEAD_LENGTH;
+    cctx->recv = 0;
+    cctx->offset = 0;
+    memset(cctx->buf, 0, sizeof(cctx->buf));
+    cctx->magic = (PAD_MAGIC ^ c->id ^ conf->time) & 0x7FFFFFFF;
+    cctx->pad = cctx->magic;
 
     ap_add_input_filter(myfixip_filter_name, cctx, NULL, c);
 
@@ -366,9 +393,92 @@ static void rewrite_req_ip(request_rec *r, const char *new_ip)
     apr_sockaddr_ip_get(&_REMOTE_HOST, _USERAGENT_ADDR);
     //c->remote_host = NULL; // Force DNS re-resolution
 #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::rewrite_req_ip IP Connection from: %s [%s] to port=%d newip=%s (OK)", _CLIENT_IP, _USERAGENT_IP, c->local_addr->port, new_ip);
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::rewrite_req_ip IP Connection from: %s:%d [%s] to port=%d newip=%s (OK)", _CLIENT_IP, _CLIENT_ADDR->port, _USERAGENT_IP, c->local_addr->port, new_ip);
 #endif
 }
+
+/**
+ * Rewrite UserAgent IP
+ */
+static int process_proxy_header(ap_filter_t *f)
+{
+    conn_rec *c = f->c;
+    my_ctx *ctx = f->ctx;
+    if (ctx->offset < 15) {
+        return FALSE;
+    }
+    char *end = ctx->buf + ctx->offset - 2;
+    if ((end[0] != '\r') || (end[1] != '\n')) {
+        return FALSE;
+    }
+    end[0] = ' '; // for next split
+    end[1] = 0;
+#ifdef DEBUG
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::process_proxy_header DEBUG: CMD=PROXY header=%s", ctx->buf);
+#endif
+    apr_size_t length = (end + 2 - ctx->buf);
+    int size = length - 1;
+    char *ptr = (char *) ctx->buf;
+    int tok = 0;
+    char *srcip = NULL, *dstip = NULL, *srcport = NULL, *dstport = NULL;
+    while (ptr) {
+        char *f = memchr(ptr, ' ', size);
+        if (!f) {
+            break;
+        }
+        *f = '\0';
+#ifdef DEBUG
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::process_proxy_header DEBUG: CMD=PROXY token=%s [%d]", ptr, tok);
+#endif
+        // PROXY TCP4 255.255.255.255 255.255.255.255 65535 65535
+        switch (tok) {
+            case 0: // PROXY
+                if (ptr[4] != 'Y') {
+                    return FALSE;
+                }
+                break;
+            case 2: // SRCIP
+                srcip = ptr;
+                break;
+            case 3: // DSTIP
+                dstip = ptr;
+                break;
+            case 4: // SRCPORT
+                srcport = ptr;
+                break;
+            case 5: // DSTPORT
+                dstport = ptr;
+                break;
+            case 1: // PROTO
+                if (strncmp("TCP", ptr, 3) == 0) {
+                    if ((ptr[3] != '4') &&
+                        (ptr[3] != '6')) {
+                        return FALSE;
+                    }
+                }
+                break;
+            default:
+                srcip = dstip = srcport = dstport = NULL;
+                return FALSE;
+        }
+        size -= (f + 1 - ptr);
+        ptr = f + 1;
+        tok++;
+    }
+    if (!dstport) {
+        return FALSE;
+    }
+    if (ctx->pad != ctx->magic) {
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::process_proxy_header padding magic fail (bad=%d vs good=%d)", ctx->pad, ctx->magic);
+        return FALSE;
+    }
+    apr_table_set(c->notes, NOTE_REWRITE_IP, srcip);
+#ifdef DEBUG
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::process_proxy_header DEBUG: CMD=PROXY tokens OK");
+#endif
+    return TRUE;
+}
+
 
 /**
  * Process input stream
@@ -377,218 +487,246 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
 {
     conn_rec *c = f->c;
     my_ctx *ctx = f->ctx;
-    const char *str = NULL;
-    apr_size_t length = 0;
-    apr_bucket *e = NULL;
-
-#ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in IP Connection from: %s to port=%d readbytes=%" APR_OFF_T_FMT " (1)", _CLIENT_IP, c->local_addr->port, readbytes);
-#endif
 
     // Fail quickly if the connection has already been aborted.
     if (c->aborted) {
         apr_brigade_cleanup(b);
         return APR_ECONNABORTED;
     }
-
-    ap_get_brigade(f->next, b, mode, block, readbytes);
-    e = APR_BRIGADE_FIRST(b);
-
-    if (APR_BRIGADE_EMPTY(b)) {
-        return APR_SUCCESS;
+    // Fast passthrough
+    if (ctx->phase == PHASE_DONE) {
+        return ap_get_brigade(f->next, b, mode, block, readbytes);
     }
 
-    if (e->type == NULL) {
-        return APR_SUCCESS;
-    }
-
-    if (ctx->iter) {
-        return APR_SUCCESS;
-    } else {
-        ctx->iter = 1;
-    }
-
+    // Process Head
+    do {
 #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in IP Connection from: %s to port=%d (2)", _CLIENT_IP, c->local_addr->port);
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d need=%" APR_OFF_T_FMT " phase=%d (1)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->need, ctx->phase);
 #endif
 
-    // Read first bucket (we need few bytes)
-    apr_status_t s = apr_bucket_read(e, &str, &length, APR_BLOCK_READ);
-    if (s != APR_SUCCESS)
-        return s;
-
-    // TEST Command
-    if (strncmp(TEST, str, 4) == 0) {
-        apr_socket_t *csd = ap_get_module_config(c->conn_config, &core_module);
-
-        length = strlen(TEST_RES_OK);
-        apr_socket_send(csd, TEST_RES_OK, &length);
-        apr_socket_shutdown(csd, APR_SHUTDOWN_WRITE);
-        apr_socket_close(csd);
-
-#ifdef DEBUG
-        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=TEST OK");
-#endif
-
-        // No need to check for SUCCESS, we did that above
-        c->aborted = 1;
-        return APR_ECONNABORTED;
-    }
-    // HELO Command
-    if (strncmp(HELO, str, 4) == 0) {
-#ifdef DEBUG
-        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=HELO OK");
-#endif
-        // delete HELO header
-        apr_bucket_split(e, 8);
-        APR_BUCKET_REMOVE(e);
-        e = APR_BUCKET_NEXT(e);
-
-        // REWRITE CLIENT IP
-        const char *new_ip = fromBinIPtoString(c->pool, str+4);
-        if (!new_ip) {
-            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in ERROR: HELO+IP invalid");
-            return APR_SUCCESS;
-        }
-
-        apr_table_set(c->notes, NOTE_REWRITE_IP, new_ip);
-        return APR_SUCCESS;
-    }
-    // PROXY Command
-    if (strncmp(PROXY, str, 5) == 0) {
-#ifdef DEBUG
-        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=PROXY OK");
-#endif
-        // Read full header from buckets
-        apr_uint32_t offset = 0;
-        char buf[PROXY_MAX_LENGTH + 1]; // worst case
-        while ((offset < PROXY_MAX_LENGTH) && (e != APR_BRIGADE_SENTINEL(b))) {
-            apr_status_t s = apr_bucket_read(e, &str, &length, APR_BLOCK_READ);
-            if (s != APR_SUCCESS) {
-                return s;
-            }
-            if ((offset + length) > PROXY_MAX_LENGTH) { // Overflow
-                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in ERROR: PROXY protocol header overflow from=%s to port=%d length=%d", _CLIENT_IP, c->local_addr->port, (length + offset));
-                goto ABORT_CONN2;
-            }
-#ifdef DEBUG
-            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: Data read from: %s to port=%d (3) length=%d off=%d", _CLIENT_IP, c->local_addr->port, length, offset);
-#endif
-            char *end = memchr(str, '\r', length - 1);
-            if (end) {
-                apr_size_t nlength = end - str + 2;
-#ifdef DEBUG
-                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: split length=%d rest=%d", length, nlength);
-#endif
-                if (length != nlength) {
-                    length = nlength;
-                    apr_bucket_split(e, length);
-                }
-            }
-            memcpy(buf + offset, str, length);
-            offset += length;
-            buf[offset] = 0;
-#ifdef DEBUG
-            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: Data read from: %s to port=%d (4) length=%d newoff=%d (%s)", _CLIENT_IP, c->local_addr->port, length, offset, buf);
-#endif
-            APR_BUCKET_REMOVE(e);
-            e = APR_BUCKET_NEXT(e);
-            if (end) {
-                break;
-            } else {
-                // Refill buckets
-                if ((e == APR_BRIGADE_SENTINEL(b)) && APR_BRIGADE_EMPTY(b)) {
-#ifdef DEBUG
-                    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: refill buffer size=%" APR_OFF_T_FMT " (1)", readbytes);
-#endif
-                    ap_get_brigade(f->next, b, mode, block, readbytes);
-                    e = APR_BRIGADE_FIRST(b);
-                }
-            }
-        }
-
-        char *end = buf + offset - 2;
-        if ((end[0] != '\r') || (end[1] != '\n')) {
-            goto ABORT_CONN;
-        }
-        end[0] = ' '; // for next split
-        end[1] = 0;
-#ifdef DEBUG
-        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=PROXY header=%s", buf);
-#endif
-        length = (end + 2 - buf);
-        int size = length - 1;
-        char *ptr = (char *) buf;
-        int tok = 0;
-        char *srcip = NULL, *dstip = NULL, *srcport = NULL, *dstport = NULL;
-        while (ptr) {
-            char *f = memchr(ptr, ' ', size);
-            if (!f) {
-                break;
-            }
-            *f = '\0';
-#ifdef DEBUG
-            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=PROXY token=%s [%d]", ptr, tok);
-#endif
-            // PROXY TCP4 255.255.255.255 255.255.255.255 65535 65535
-            switch (tok) {
-                case 0: // PROXY
-                    break;
-                case 2: // SRCIP
-                    srcip = ptr;
-                    break;
-                case 3: // DSTIP
-                    dstip = ptr;
-                    break;
-                case 4: // SRCPORT
-                    srcport = ptr;
-                    break;
-                case 5: // DSTPORT
-                    dstport = ptr;
-                    break;
-                case 1: // PROTO
-                    if (strncmp("TCP", ptr, 3) == 0) {
-                        if ((ptr[3] == '4') ||
-                            (ptr[3] == '6')) {
-                            break;
-                        }
-                    }
-                default:
-                    srcip = dstip = srcport = dstport = NULL;
-                    goto ABORT_CONN;
-            }
-            size -= (f + 1 - ptr);
-            ptr = f + 1;
-            tok++;
-        }
-        if (!dstport) {
-            goto ABORT_CONN;
-        }
-        apr_table_set(c->notes, NOTE_REWRITE_IP, srcip);
-#ifdef DEBUG
-        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=PROXY tokens OK");
-#endif
-        // Refill buckets
         if (APR_BRIGADE_EMPTY(b)) {
 #ifdef DEBUG
-            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: refill buffer size=%" APR_OFF_T_FMT " (2)", readbytes);
+            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d need=%" APR_OFF_T_FMT " phase=%d (2)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->need, ctx->phase);
 #endif
-            ap_get_brigade(f->next, b, mode, block, readbytes);
-            e = APR_BRIGADE_FIRST(b);
+            apr_status_t s = ap_get_brigade(f->next, b, ctx->mode, APR_BLOCK_READ, ctx->need);
+            if (s != APR_SUCCESS) {
+#ifdef DEBUG
+                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d need=%" APR_OFF_T_FMT " phase=%d (fail)(1)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->need, ctx->phase);
+#endif
+                return s;
+            }
         }
-        return APR_SUCCESS;
+        if (ctx->phase == PHASE_DONE) {
+            return APR_SUCCESS;
+        }
+        if (APR_BRIGADE_EMPTY(b)) {
+#ifdef DEBUG
+            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d need=%" APR_OFF_T_FMT " phase=%d (empty)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->need, ctx->phase);
+#endif
+            return APR_SUCCESS;
+        }
+        apr_bucket *e = NULL;
+        for (e = APR_BRIGADE_FIRST(b); e != APR_BRIGADE_SENTINEL(b); e = APR_BUCKET_NEXT(e)) {
+            if (e->type == NULL) {
+#ifdef DEBUG
+                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d need=%" APR_OFF_T_FMT " phase=%d (type=NULL)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->need, ctx->phase);
+#endif
+                return APR_SUCCESS;
+            }
+
+            // We need more data
+            if (ctx->need > 0) {
+                const char *str = NULL;
+                apr_size_t length = 0;
+                apr_status_t s = apr_bucket_read(e, &str, &length, APR_BLOCK_READ);
+                if (s != APR_SUCCESS) {
+#ifdef DEBUG
+                    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d need=%" APR_OFF_T_FMT " recv=%" APR_OFF_T_FMT " phase=%d readed=%d (fail)(2)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->need, ctx->recv, ctx->phase, length);
+#endif
+                    return s;
+                }
+#ifdef DEBUG
+                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d need=%" APR_OFF_T_FMT " recv=%" APR_OFF_T_FMT " phase=%d readed=%d (3)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->need, ctx->recv, ctx->phase, length);
+#endif
+                if (length > 0) {
+                    if ((ctx->offset + length) > PROXY_MAX_LENGTH) { // Overflow
+                        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in ERROR: PROXY protocol header overflow from=%s to port=%d length=%" APR_OFF_T_FMT, _CLIENT_IP, c->local_addr->port, (ctx->offset + length));
+                        goto ABORT_CONN2;
+                    }
+                    memcpy(ctx->buf + ctx->offset, str, length);
+                    if (ctx->pad != ctx->magic) {
+                        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in padding magic fail (bad=%d vs good=%d)", ctx->pad, ctx->magic);
+                        goto ABORT_CONN;
+                    }
+                    ctx->offset += length;
+                    ctx->recv += length;
+                    ctx->need -= length;
+                    ctx->buf[ctx->offset] = 0;
+                    // delete HEAD
+                    if (e->length > length) {
+                        apr_bucket_split(e, length);
+                    }
+                }
+                APR_BUCKET_REMOVE(e);
+                if (length == 0) {
+#ifdef DEBUG
+                    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG bucket flush=%d meta=%d", APR_BUCKET_IS_FLUSH(e) ? 1 : 0, APR_BUCKET_IS_METADATA(e) ? 1 : 0);
+#endif
+                    continue;
+                }
+            }
+            // Handle GETLINE mode
+            if (ctx->mode == AP_MODE_GETLINE) {
+                if ((ctx->need > 0) && (ctx->recv > 2)) {
+                    char *end = memchr(ctx->buf, '\r', ctx->offset - 1);
+                    if (end) {
+#ifdef DEBUG
+                        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: GETLINE OK");
+#endif
+                        if ((end[0] == '\r') && (end[1] == '\n')) {
+                            ctx->need = 0;
+                        }
+                    }
+                }
+            }
+            if (ctx->need <= 0) {
+#ifdef DEBUG
+                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d need=%" APR_OFF_T_FMT " recv=%" APR_OFF_T_FMT " phase=%d (4)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->need, ctx->recv, ctx->phase);
+#endif
+                switch (ctx->phase) {
+                    case PHASE_WANT_HEAD: {
+#ifdef DEBUG
+                        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d phase=%d checking=%s buf=%s", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->phase, "HEAD", ctx->buf);
+#endif
+                        // TEST Command
+#ifdef DEBUG
+                        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=TEST CHECK");
+#endif
+                        if (strncmp(TEST, ctx->buf, 4) == 0) {
+                            apr_socket_t *csd = ap_get_module_config(c->conn_config, &core_module);
+                            apr_size_t length = strlen(TEST_RES_OK);
+                            apr_socket_send(csd, TEST_RES_OK, &length);
+                            apr_socket_shutdown(csd, APR_SHUTDOWN_WRITE);
+                            apr_socket_close(csd);
+
+#ifdef DEBUG
+                            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=TEST OK");
+#endif
+
+                            // No need to check for SUCCESS, we did that above
+                            c->aborted = 1;
+                            return APR_ECONNABORTED;
+                        }
+                        // HELO Command
+#ifdef DEBUG
+                        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=HELO CHECK");
+#endif
+                        if (strncmp(HELO, ctx->buf, 4) == 0) {
+#ifdef DEBUG
+                            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=HELO OK");
+#endif
+                            ctx->phase = PHASE_WANT_BINIP;
+                            ctx->mode = AP_MODE_READBYTES;
+                            ctx->need = 4;
+                            ctx->recv = 0;
+                            break;
+                        }
+                        // PROXY Command
+#ifdef DEBUG
+                        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=PROXY CHECK");
+#endif
+                        if (strncmp(PROXY, ctx->buf, 4) == 0) {
+#ifdef DEBUG
+                            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG: CMD=PROXY OK");
+#endif
+                            ctx->phase = PHASE_WANT_LINE;
+                            ctx->mode = AP_MODE_GETLINE;
+                            ctx->need = PROXY_MAX_LENGTH - ctx->offset;
+                            ctx->recv = 0;
+                            break;
+                        }
+                        // ELSE... GET / POST / etc
+                        ctx->phase = PHASE_DONE;
+#ifdef DEBUG
+                        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG from: %s:%d to port=%d newBucket (1) size=%" APR_OFF_T_FMT, _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->offset);
+#endif
+                        // Restore original data
+                        if (ctx->offset) {
+                            e = apr_bucket_heap_create(ctx->buf, ctx->offset, NULL, c->bucket_alloc);
+                            APR_BRIGADE_INSERT_HEAD(b, e);
+                            return APR_SUCCESS;
+                        }
+                        break;
+                    }
+                    case PHASE_WANT_BINIP: {
+#ifdef DEBUG
+                        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d phase=%d checking=%s", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->phase, "BINIP");
+#endif
+                        // REWRITE CLIENT IP
+                        const char *new_ip = fromBinIPtoString(c->pool, ctx->buf+4);
+                        if (!new_ip) {
+                            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in ERROR: HELO+IP invalid");
+                            goto ABORT_CONN;
+                        }
+
+                        apr_table_set(c->notes, NOTE_REWRITE_IP, new_ip);
+                        ctx->phase = PHASE_DONE;
+#ifdef DEBUG
+                        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG from: %s:%d to port=%d newip=%s", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, new_ip);
+#endif
+                        break;
+                    }
+                    case PHASE_WANT_LINE: {
+#ifdef DEBUG
+                        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d phase=%d checking=%s buf=%s", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->phase, "LINE", ctx->buf);
+#endif
+                        ctx->phase = PHASE_DONE;
+                        char *end = memchr(ctx->buf, '\r', ctx->offset - 1);
+                        if (!end) {
+                            goto ABORT_CONN;
+                        }
+                        if ((end[0] != '\r') || (end[1] != '\n')) {
+                            goto ABORT_CONN;
+                        }
+                        if (!process_proxy_header(f)) {
+                            goto ABORT_CONN;
+                        }
+                        // Restore original data
+                        int count = (ctx->offset - ((end - ctx->buf) + 2));
+#ifdef DEBUG
+                        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG from: %s:%d to port=%d newBucket (2) size=%d rest=%s", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, count, end + 2);
+#endif
+                        if (count > 0) {
+                            e = apr_bucket_heap_create(end + 2, count, NULL, c->bucket_alloc);
+                            APR_BRIGADE_INSERT_HEAD(b, e);
+                            return APR_SUCCESS;
+                        }
+                        break;
+                    }
+                }
+                if (ctx->phase == PHASE_DONE) {
+#ifdef DEBUG
+                    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d phase=%d (DONE)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->phase);
+#endif
+                    ctx->mode = mode;
+                    ctx->need = 0;
+                    ctx->recv = 0;
+                }
+                break;
+            }
+        }
+    } while (ctx->phase != PHASE_DONE);
+
+    return ap_get_brigade(f->next, b, mode, block, readbytes);
 
     ABORT_CONN:
         ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in ERROR: PROXY protocol header invalid from=%s to port=%d", _CLIENT_IP, c->local_addr->port);
     ABORT_CONN2:
         c->aborted = 1;
         return APR_ECONNABORTED;
-    }
-
-    //ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME " DEBUG-ED!!");
-
-    return APR_SUCCESS;
 }
+
+
 
 static int post_read_handler(request_rec *r)
 {
@@ -613,7 +751,7 @@ static int post_read_handler(request_rec *r)
     }
 
 #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::post_read_handler IP Connection from: %s [%s] to port=%d newip=%s (OK)", _CLIENT_IP, _USERAGENT_IP, c->local_addr->port, new_ip);
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::post_read_handler IP Connection from: %s:%d [%s] to port=%d newip=%s (OK)", _CLIENT_IP, _CLIENT_ADDR->port, _USERAGENT_IP, c->local_addr->port, new_ip);
 #endif
     if (new_ip && strcmp(_USERAGENT_IP, new_ip)) { // Change
         rewrite_req_ip(r, new_ip);
