@@ -67,6 +67,9 @@
     by running:
 
     $ apxs2 -c -i mod_myfixip.c
+    
+    # How-TO enable PROXY protocol in ELB:
+    https://gist.github.com/pablitoc/91c40d820f207879969c
 
     = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
     Licensed under the Apache License, Version 2.0 (the "License");
