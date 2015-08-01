@@ -13,6 +13,7 @@
     v0.8 - 2015.06.29, fixing zero length
     v0.9 - 2015.07.03, handle fragmented headers
     v1.0 - 2015.08.01, fix excess memory usage with keepalive request
+    v1.1 - 2015.08.01, improved handling of mod_proxy request
 
     = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
     In HTTP (no SSL): this will fix "useragent_ip" field if the request
@@ -107,13 +108,14 @@
 #include "apr_strings.h"
 #include "scoreboard.h"
 #include "http_core.h"
+#include "ap_listen.h"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
 #define MODULE_NAME "mod_myfixip"
-#define MODULE_VERSION "1.0"
+#define MODULE_VERSION "1.1"
 
 module AP_MODULE_DECLARE_DATA myfixip_module;
 
@@ -324,11 +326,38 @@ static int check_trusted( conn_rec *c, my_config *conf )
 }
 
 /**
+ * Check if connection is inbound
+ */
+static int check_inbound( conn_rec *c )
+{
+    apr_port_t port = c->local_addr->port;
+    ap_listen_rec *l;
+
+    for (l = ap_listeners; l != NULL; l = l->next) {
+        if (l->bind_addr != NULL) {
+            if (port == l->bind_addr->port) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/**
  * Pre Connection
  */
 static int pre_connection(conn_rec *c, void *csd)
 {
     my_config *conf = ap_get_module_config (c->base_server->module_config, &myfixip_module);
+
+#ifdef DEBUG
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::pre_connection IP Connection remote: %s:%d localport=%d (1)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port);
+#endif
+
+    if (!check_inbound(c)) { // Not Inbound (mod_proxy)
+        return DECLINED;
+    }
 
 #ifdef DEBUG
     ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::pre_connection IP Connection from: %s:%d to port=%d (1)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port);
