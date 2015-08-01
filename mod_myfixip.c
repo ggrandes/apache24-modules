@@ -12,6 +12,7 @@
     v0.7 - 2015.01.24, use defined format (APR_OFF_T_FMT) for apr_off_t
     v0.8 - 2015.06.29, fixing zero length
     v0.9 - 2015.07.03, handle fragmented headers
+    v1.0 - 2015.08.01, fix excess memory usage with keepalive request
 
     = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
     In HTTP (no SSL): this will fix "useragent_ip" field if the request
@@ -112,7 +113,7 @@
 #include <arpa/inet.h>
 
 #define MODULE_NAME "mod_myfixip"
-#define MODULE_VERSION "0.9"
+#define MODULE_VERSION "1.0"
 
 module AP_MODULE_DECLARE_DATA myfixip_module;
 
@@ -323,14 +324,14 @@ static int check_trusted( conn_rec *c, my_config *conf )
 }
 
 /**
- * Process Connection
+ * Pre Connection
  */
-static int process_connection(conn_rec *c)
+static int pre_connection(conn_rec *c, void *csd)
 {
     my_config *conf = ap_get_module_config (c->base_server->module_config, &myfixip_module);
 
 #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::process_connection IP Connection from: %s:%d to port=%d (1)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port);
+    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::pre_connection IP Connection from: %s:%d to port=%d (1)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port);
 #endif
 
     if (!check_trusted(c, conf)) { // Not Trusted
@@ -777,7 +778,7 @@ static void register_hooks(apr_pool_t *p)
     ap_register_input_filter(myfixip_filter_name, helocon_filter_in, NULL, AP_FTYPE_CONNECTION + 9);
     ap_hook_post_config(post_config, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_child_init(child_init, NULL, NULL, APR_HOOK_MIDDLE);
-    ap_hook_process_connection(process_connection, NULL, NULL, APR_HOOK_FIRST);
+    ap_hook_pre_connection(pre_connection, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_post_read_request(post_read_handler, NULL, NULL, APR_HOOK_FIRST);
 }
 
