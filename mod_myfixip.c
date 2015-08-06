@@ -14,6 +14,7 @@
     v0.9 - 2015.07.03, handle fragmented headers
     v1.0 - 2015.08.01, fix excess memory usage with keepalive request
     v1.1 - 2015.08.01, improved handling of mod_proxy request
+    v1.2 - 2015.08.06, memory cleanups: bucket and brigades
 
     = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
     In HTTP (no SSL): this will fix "useragent_ip" field if the request
@@ -115,7 +116,7 @@
 #include <arpa/inet.h>
 
 #define MODULE_NAME "mod_myfixip"
-#define MODULE_VERSION "1.1"
+#define MODULE_VERSION "1.2"
 
 module AP_MODULE_DECLARE_DATA myfixip_module;
 
@@ -600,7 +601,7 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
                         apr_bucket_split(e, length);
                     }
                 }
-                APR_BUCKET_REMOVE(e);
+                apr_bucket_delete(e);
                 if (length == 0) {
 #ifdef DEBUG
                     ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in DEBUG bucket flush=%d meta=%d", APR_BUCKET_IS_FLUSH(e) ? 1 : 0, APR_BUCKET_IS_METADATA(e) ? 1 : 0);
@@ -648,6 +649,7 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
 
                             // No need to check for SUCCESS, we did that above
                             c->aborted = 1;
+                            apr_brigade_cleanup(b);
                             return APR_ECONNABORTED;
                         }
                         // HELO Command
@@ -756,6 +758,7 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
         ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in ERROR: PROXY protocol header invalid from=%s to port=%d", _CLIENT_IP, c->local_addr->port);
     ABORT_CONN2:
         c->aborted = 1;
+        apr_brigade_cleanup(b);
         return APR_ECONNABORTED;
 }
 
