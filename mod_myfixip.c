@@ -15,6 +15,7 @@
     v1.0 - 2015.08.01, fix excess memory usage with keepalive request
     v1.1 - 2015.08.01, improved handling of mod_proxy request
     v1.2 - 2015.08.06, memory cleanups: bucket and brigades
+    v1.3 - 2015.12.27, connection cleanup: non-PROXY partial headers
 
     = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
     In HTTP (no SSL): this will fix "useragent_ip" field if the request
@@ -116,7 +117,7 @@
 #include <arpa/inet.h>
 
 #define MODULE_NAME "mod_myfixip"
-#define MODULE_VERSION "1.2"
+#define MODULE_VERSION "1.3"
 
 module AP_MODULE_DECLARE_DATA myfixip_module;
 
@@ -689,7 +690,7 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
                         if (ctx->offset) {
                             e = apr_bucket_heap_create(ctx->buf, ctx->offset, NULL, c->bucket_alloc);
                             APR_BRIGADE_INSERT_HEAD(b, e);
-                            return APR_SUCCESS;
+                            goto END_CONN;
                         }
                         break;
                     }
@@ -734,7 +735,7 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
                         if (count > 0) {
                             e = apr_bucket_heap_create(end + 2, count, NULL, c->bucket_alloc);
                             APR_BRIGADE_INSERT_HEAD(b, e);
-                            return APR_SUCCESS;
+                            goto END_CONN;
                         }
                         break;
                     }
@@ -752,7 +753,8 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
         }
     } while (ctx->phase != PHASE_DONE);
 
-    return ap_get_brigade(f->next, b, mode, block, readbytes);
+    END_CONN:
+        return ap_get_brigade(f->next, b, mode, block, readbytes);
 
     ABORT_CONN:
         ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in ERROR: PROXY protocol header invalid from=%s to port=%d", _CLIENT_IP, c->local_addr->port);
