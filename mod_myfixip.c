@@ -576,12 +576,12 @@ static apr_status_t helocon_filter_in(ap_filter_t *f, apr_bucket_brigade *b, ap_
                 apr_status_t s = apr_bucket_read(e, &str, &length, APR_BLOCK_READ);
                 if (s != APR_SUCCESS) {
 #ifdef DEBUG
-                    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d need=%" APR_OFF_T_FMT " recv=%" APR_OFF_T_FMT " phase=%d readed=%d (fail)(2)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->need, ctx->recv, ctx->phase, length);
+                    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d need=%" APR_OFF_T_FMT " recv=%" APR_OFF_T_FMT " phase=%d readed=%" APR_SIZE_T_FMT " (fail)(2)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->need, ctx->recv, ctx->phase, length);
 #endif
                     return s;
                 }
 #ifdef DEBUG
-                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d need=%" APR_OFF_T_FMT " recv=%" APR_OFF_T_FMT " phase=%d readed=%d (3)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->need, ctx->recv, ctx->phase, length);
+                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, MODULE_NAME "::helocon_filter_in from: %s:%d to port=%d need=%" APR_OFF_T_FMT " recv=%" APR_OFF_T_FMT " phase=%d readed=%" APR_SIZE_T_FMT " (3)", _CLIENT_IP, _CLIENT_ADDR->port, c->local_addr->port, ctx->need, ctx->recv, ctx->phase, length);
 #endif
                 if (length > 0) {
                     if ((ctx->offset + length) > PROXY_MAX_LENGTH) { // Overflow
