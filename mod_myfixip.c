@@ -16,6 +16,7 @@
     v1.1 - 2015.08.01, improved handling of mod_proxy request
     v1.2 - 2015.08.06, memory cleanups: bucket and brigades
     v1.3 - 2015.12.27, connection cleanup: non-PROXY partial headers
+    v1.4 - 2016.01.06, fix order with mod_security2
 
     = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
     In HTTP (no SSL): this will fix "useragent_ip" field if the request
@@ -117,7 +118,7 @@
 #include <arpa/inet.h>
 
 #define MODULE_NAME "mod_myfixip"
-#define MODULE_VERSION "1.3"
+#define MODULE_VERSION "1.4"
 
 module AP_MODULE_DECLARE_DATA myfixip_module;
 
@@ -805,6 +806,11 @@ static void child_init(apr_pool_t *p, server_rec *s)
 
 static void register_hooks(apr_pool_t *p)
 {
+    static const char *const postread_afterme_list[] = {
+        "mod_security2.c",
+        NULL
+    };
+
     /*
      * mod_ssl is AP_FTYPE_CONNECTION + 5 and mod_myfixip needs to
      * be called before mod_ssl.
@@ -813,10 +819,10 @@ static void register_hooks(apr_pool_t *p)
     ap_hook_post_config(post_config, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_child_init(child_init, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_pre_connection(pre_connection, NULL, NULL, APR_HOOK_MIDDLE);
-    ap_hook_post_read_request(post_read_handler, NULL, NULL, APR_HOOK_FIRST);
+    ap_hook_post_read_request(post_read_handler, NULL, postread_afterme_list, APR_HOOK_REALLY_FIRST);
 }
 
-module AP_MODULE_DECLARE_DATA myfixip_module = {
+AP_DECLARE_MODULE(myfixip) = {
     STANDARD20_MODULE_STUFF,
     NULL,                       // create per-dir config structures
     NULL,                       // merge  per-dir    config structures
