@@ -822,7 +822,7 @@ static void register_hooks(apr_pool_t *p)
     ap_hook_post_read_request(post_read_handler, NULL, postread_afterme_list, APR_HOOK_REALLY_FIRST);
 }
 
-AP_DECLARE_MODULE(myfixip) = {
+module AP_MODULE_DECLARE_DATA myfixip_module = {
     STANDARD20_MODULE_STUFF,
     NULL,                       // create per-dir config structures
     NULL,                       // merge  per-dir    config structures
